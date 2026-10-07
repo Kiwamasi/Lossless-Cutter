@@ -1,0 +1,6 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Shortcuts hold absolute paths for one PC; recreate with tools/create_shortcut.ps1
+*.lnk

@@ -1,3 +1,5 @@
+<img src="app/icon.png" width="96" align="right" alt="">
+
 # Video Cutter
 
 Quick, lossless video cutter. Python + PySide6 (Qt) UI on top of `ffmpeg -c copy`,
@@ -10,7 +12,7 @@ The app does **not** install anything itself. You need three things:
 | Requirement | Why | How to install |
 |---|---|---|
 | **Python 3.10+** | Runs the app | `winget install Python.Python.3.13`, or download from [python.org](https://www.python.org/downloads/). In the installer, tick **"Add python.exe to PATH"**. |
-| **PySide6** | The Qt UI and video player | `pip install -r requirements.txt` (run in this folder) or `pip install PySide6` |
+| **PySide6** | The Qt UI and video player | `pip install PySide6` |
 | **ffmpeg + ffprobe** | Does the actual cutting and reads video info | `winget install Gyan.FFmpeg` (installs both) |
 
 After installing, **open a new terminal** so the updated PATH is picked up, then check everything with:
@@ -22,12 +24,29 @@ After installing, **open a new terminal** so the updated PATH is picked up, then
 
 If any of these print an error, that requirement is missing or not on PATH.
 
-> If PySide6 is missing, `Video Cutter.bat` fails silently (it starts Python without a console window).
-> Run `python main.py` in a terminal to see the error. If ffmpeg is missing, the app tells you on startup.
+> If PySide6 is missing, the shortcut fails silently (it starts Python without a console window).
+> Run `python app\main.py` in a terminal to see the error. If ffmpeg is missing, the app tells you on startup.
 
 ## Run
 
-    "Video Cutter.bat"            (or: python main.py [video])
+Double-click **Video Cutter** (the shortcut with the icon) in this folder. It starts the app with no console window.
+
+The shortcut isn't in the repository (it contains paths specific to one PC). To create it, for example after
+cloning, moving the folder or reinstalling Python, run in this folder:
+
+    powershell -ExecutionPolicy Bypass -File tools\create_shortcut.ps1              # shortcut in this folder
+    powershell -ExecutionPolicy Bypass -File tools\create_shortcut.ps1 -Desktop     # ...and on the desktop
+    powershell -ExecutionPolicy Bypass -File tools\create_shortcut.ps1 -StartMenu   # ...and in the Start menu
+
+You can also right-click the shortcut → *Pin to Start* / *Show more options → Pin to taskbar*.
+From a terminal: `python app\main.py [video]`.
+
+## Project layout
+
+    app/        main.py (the whole app), icon.ico (app + shortcut icon), icon.png
+    tools/      make_icon.py (draws the icon), create_shortcut.ps1 (makes the shortcut)
+
+The icon is drawn in code. Edit `tools/make_icon.py` and run `python tools\make_icon.py` to regenerate it.
 
 ## Use
 

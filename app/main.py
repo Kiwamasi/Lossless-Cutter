@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QElapsedTimer, QObject, QPointF, QProcess, QRectF, QSettings, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QPolygonF
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPalette, QPen, QPolygonF
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -1203,8 +1203,13 @@ def apply_dark_theme(app):
 
 
 def main():
+    if sys.platform == "win32":
+        # Own taskbar identity, so Windows shows our icon instead of Python's.
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("VideoCutter.App")
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setWindowIcon(QIcon(str(Path(__file__).with_name("icon.ico"))))
     apply_dark_theme(app)
     win = MainWindow()
     win.show()
