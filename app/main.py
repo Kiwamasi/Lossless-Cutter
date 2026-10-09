@@ -3,23 +3,28 @@
 Plays the video with Qt, lets you mark parts on a timeline, and exports each
 part with `ffmpeg -c copy` (no re-encode), so even huge files cut in seconds.
 """
+import bisect
+import datetime
+import itertools
 import json
+import tempfile
 import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QElapsedTimer, QObject, QPointF, QProcess, QRectF, QSettings, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QElapsedTimer, QLineF, QObject, QPointF, QProcess, QRectF, QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPalette, QPen, QPolygonF
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSlider, QSplitter, QStyle, QTableWidget,
+    QAbstractItemView, QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QSplitter, QStyle, QTableWidget, QTabWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -44,17 +49,21 @@ Ctrl+G\tGo to a time
 S\tSplit the part under the playhead (first press splits the whole video)
 N\tSplit the whole video into N equal parts
 I / O\tMark the in / out point of a new part
-Delete\tRemove the selected part
+Delete\tRemove the selected part, or the selected silent blocks
 Esc\tClear the in point / selection
 Ctrl+Z\tUndo the last change to the parts
 Ctrl+Y / Ctrl+Shift+Z\tRedo
+
+Click a red block\tSelect it (Ctrl+click to select several)
+Ctrl+A\tSelect every silent block
 
 Mouse wheel on timeline\tZoom
 Shift + wheel\tScroll the timeline
 Drag a part's edge\tAdjust it
 Ctrl+0 / Ctrl+= / Ctrl+-\tZoom to fit / in / out
 
-Ctrl+O\tOpen a video
+Ctrl+O\tOpen one or more videos
+Ctrl+Shift+O\tAdd videos to the end of the timeline
 Ctrl+E\tExport parts"""
 
 
@@ -100,7 +109,7 @@ def sanitize_filename(name):
 def probe(ffprobe, path):
     res = subprocess.run(
         [ffprobe, "-v", "error", "-show_entries",
-         "format=duration,size:stream=codec_type,avg_frame_rate,width,height", "-of", "json", path],
+         "format=duration,size:stream=codec_type,codec_name,avg_frame_rate,width,height", "-of", "json", path],
         capture_output=True, text=True, creationflags=NO_WINDOW, timeout=120,
     )
     if res.returncode != 0:
@@ -110,10 +119,12 @@ def probe(ffprobe, path):
     info = {
         "duration": float(fmt.get("duration") or 0),
         "size": int(fmt.get("size") or os.path.getsize(path)),
-        "fps": 30.0, "width": 0, "height": 0,
+        "fps": 30.0, "width": 0, "height": 0, "vcodec": "", "acodec": "",
     }
+    st = os.stat(path)
+    info["created"] = getattr(st, "st_birthtime", st.st_ctime)  # file creation time on Windows
     for s in data.get("streams", []):
-        if s.get("codec_type") == "video":
+        if s.get("codec_type") == "video" and not info["vcodec"]:
             num, _, den = s.get("avg_frame_rate", "0/1").partition("/")
             try:
                 if float(num) > 0 and float(den or 1) > 0:
@@ -121,33 +132,46 @@ def probe(ffprobe, path):
             except ValueError:
                 pass
             info["width"], info["height"] = s.get("width", 0), s.get("height", 0)
-            break
+            info["vcodec"] = s.get("codec_name", "?")
+        elif s.get("codec_type") == "audio" and not info["acodec"]:
+            info["acodec"] = s.get("codec_name", "?")
     return info
 
 
-def nearest_keyframe(ffprobe, path, t):
-    """Time of the video keyframe closest to t, or None if none was found.
+def keyframes(ffprobe, path, t0, t1):
+    """Times of the video keyframes around t0..t1 (roughly; may include some just outside).
 
-    Only reads packet headers in a small window around t, so it is fast even on huge files.
+    Only reads packet headers in that window, so it is fast even on huge files.
     """
+    res = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-read_intervals", f"{max(0.0, t0):.3f}%{t1:.3f}",
+         "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", path],
+        capture_output=True, text=True, creationflags=NO_WINDOW, timeout=60,
+    )
+    keys = []
+    for line in res.stdout.splitlines():
+        pts, _, flags = line.partition(",")
+        if "K" in flags:
+            try:
+                keys.append(float(pts))
+            except ValueError:
+                pass
+    return keys
+
+
+def nearest_keyframe(ffprobe, path, t):
+    """Time of the video keyframe closest to t, or None if none was found."""
     for window in (10, 60):
-        res = subprocess.run(
-            [ffprobe, "-v", "error", "-select_streams", "v:0",
-             "-read_intervals", f"{max(0.0, t - window):.3f}%{t + window:.3f}",
-             "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", path],
-            capture_output=True, text=True, creationflags=NO_WINDOW, timeout=60,
-        )
-        keys = []
-        for line in res.stdout.splitlines():
-            pts, _, flags = line.partition(",")
-            if "K" in flags:
-                try:
-                    keys.append(float(pts))
-                except ValueError:
-                    pass
+        keys = keyframes(ffprobe, path, t - window, t + window)
         if keys:
             return min(keys, key=lambda k: abs(k - t))
     return None
+
+
+def last_keyframe_in(ffprobe, path, t0, t1):
+    """The last video keyframe after t0 and at or before t1, or None."""
+    return max((k for k in keyframes(ffprobe, path, t0, t1) if t0 < k <= t1 + 1e-3), default=None)
 
 
 @dataclass(eq=False)
@@ -161,76 +185,332 @@ class Segment:
         return self.end - self.start
 
 
+@dataclass(eq=False)
+class Clip:
+    """One video file on the timeline. The files play back to back in list order."""
+    path: str
+    info: dict
+
+    @property
+    def name(self):
+        return Path(self.path).name
+
+    @property
+    def duration(self):
+        return self.info["duration"]
+
+    @property
+    def format(self):
+        i = self.info
+        video = f"{i['vcodec']} {i['width']}×{i['height']} {i['fps']:.3g} fps" if i["vcodec"] else "no video"
+        return f"{video} · {i['acodec'] or 'no audio'}"
+
+
+# ---------------------------------------------------------------- waveform
+
+DB_FLOOR = -96.0       # quietest level a 16-bit sample can hold
+WAVE_DISPLAY_DB = -60  # the waveform's drawn height spans this many dB up to full scale
+
+
+def db_to_byte(db):
+    return max(0, min(255, round((db - DB_FLOOR) / -DB_FLOOR * 255)))
+
+
+def byte_to_db(b):
+    return DB_FLOOR + b / 255 * -DB_FLOOR
+
+
+# Peak sample value (0..32768) -> level byte, and level byte -> drawn height (0..1).
+PEAK_TO_BYTE = bytes([0] + [db_to_byte(20 * math.log10(m / 32768)) for m in range(1, 32769)])
+BYTE_TO_HEIGHT = [max(0.0, 1 - byte_to_db(b) / WAVE_DISPLAY_DB) for b in range(256)]
+
+
+class Waveform:
+    """Audio peak levels, one byte (a dB value, see db_to_byte) per 1/RATE seconds.
+
+    Coarser copies (each FACTOR times shorter) keep drawing fast when zoomed out on long videos.
+    """
+    RATE = 100
+    FACTOR = 16
+    LEVELS = 4
+
+    def __init__(self):
+        self.levels = [bytearray() for _ in range(self.LEVELS)]
+
+    @property
+    def loaded(self):
+        """Seconds of audio read so far."""
+        return len(self.levels[0]) / self.RATE
+
+    def append(self, peaks):
+        self.levels[0] += peaks
+        f = self.FACTOR
+        for lo, hi in zip(self.levels, self.levels[1:]):
+            for j in range(len(hi), len(lo) // f):
+                hi.append(max(lo[j * f:(j + 1) * f]))
+
+    def column_peaks(self, edges, dt):
+        """The loudest level between each pair of neighbouring times in edges (stops where data ends).
+
+        dt is the shortest column, in seconds; it picks how coarse a copy to read.
+        """
+        i = 0
+        while i + 1 < self.LEVELS and self.FACTOR ** (i + 1) / self.RATE <= dt:
+            i += 1
+        data, rate = self.levels[i], self.RATE / self.FACTOR ** i
+        out = []
+        for t0, t1 in zip(edges, edges[1:]):
+            a = int(t0 * rate)
+            if a >= len(data):
+                break
+            out.append(max(data[a:max(a + 1, int(t1 * rate))]))
+        return out
+
+    def silences(self, threshold_db, min_len):
+        """(start, end) of every stretch at least min_len seconds long that stays below threshold_db."""
+        limit = db_to_byte(threshold_db)
+        quiet = self.levels[0].translate(bytes(1 if b < limit else 0 for b in range(256)))
+        n = max(1, math.ceil(min_len * self.RATE - 1e-9))
+        # The lookbehind only lets a match start at the beginning of a quiet run, keeping this linear.
+        return [(m.start() / self.RATE, m.end() / self.RATE)
+                for m in re.finditer(rb"(?<!\x01)\x01{%d,}" % n, quiet)]
+
+
+class WaveformLoader(QObject):
+    """Decodes the first audio track with ffmpeg in the background, filling a Waveform as it goes."""
+    updated = Signal()
+    done = Signal(bool, str)
+
+    SAMPLE_RATE = 8000
+
+    def __init__(self, ffmpeg, src, parent=None):
+        super().__init__(parent)
+        self.wave = Waveform()
+        self.cancelled = False
+        self.complete = False
+        self._spb = self.SAMPLE_RATE // Waveform.RATE  # samples per peak
+        self._buf = bytearray()
+        self.proc = QProcess(self)
+        self.proc.setProgram(ffmpeg)
+        self.proc.setArguments([
+            "-hide_banner", "-nostdin", "-loglevel", "error",
+            "-i", src, "-map", "0:a:0", "-ac", "1", "-ar", str(self.SAMPLE_RATE), "-f", "s16le", "pipe:1",
+        ])
+        self.proc.readyReadStandardOutput.connect(self._on_output)
+        self.proc.finished.connect(self._on_finished)
+        self.proc.errorOccurred.connect(self._on_error)
+
+    def start(self):
+        self.proc.start()
+
+    def cancel(self):
+        self.cancelled = True
+        if self.proc.state() != QProcess.NotRunning:
+            self.proc.kill()
+            self.proc.waitForFinished(2000)
+
+    def _consume(self, final=False):
+        step = self._spb * 2
+        n = len(self._buf) if final else len(self._buf) // step * step
+        n -= n % 2
+        if not n:
+            return
+        samples = array("h")
+        samples.frombytes(bytes(self._buf[:n]))
+        del self._buf[:n]
+        spb = self._spb
+        self.wave.append(bytes(PEAK_TO_BYTE[max(max(c), -min(c))]
+                               for c in (samples[i:i + spb] for i in range(0, len(samples), spb))))
+
+    def _on_output(self):
+        self._buf += self.proc.readAllStandardOutput().data()
+        self._consume()
+        self.updated.emit()
+
+    def _on_error(self, err):
+        if err == QProcess.FailedToStart and not self.cancelled:
+            self.complete = True
+            self.done.emit(False, "Could not start ffmpeg.")
+
+    def _on_finished(self, code, _status):
+        if self.cancelled:
+            return
+        self._buf += self.proc.readAllStandardOutput().data()
+        self._consume(final=True)
+        self.complete = True
+        if code != 0 and not self.wave.levels[0]:
+            err = self.proc.readAllStandardError().data().decode(errors="ignore")
+            self.done.emit(False, "No audio track" if "matches no streams" in err else "Couldn't read the audio")
+        else:
+            self.done.emit(True, "")
+
+
+# ---------------------------------------------------------------- cuts
+
+class Cuts:
+    """Ranges of the source (in source seconds) that were deleted; everything else plays back to back.
+
+    "Edit time" is the time on the shortened video, i.e. source time minus everything removed before it.
+    Immutable: add() returns a new Cuts.
+    """
+
+    def __init__(self, ranges=()):
+        merged = []
+        for a, b in sorted(ranges):
+            if merged and a <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            elif b > a:
+                merged.append((a, b))
+        self.ranges = tuple(merged)
+        self._starts = [a for a, _ in merged]
+        self._before = list(itertools.accumulate((b - a for a, b in merged), initial=0.0))
+        self._edit_starts = [a - self._before[i] for i, (a, _) in enumerate(merged)]
+
+    def __bool__(self):
+        return bool(self.ranges)
+
+    def add(self, ranges):
+        return Cuts(self.ranges + tuple(ranges))
+
+    def containing(self, t):
+        i = bisect.bisect_right(self._starts, t) - 1
+        return self.ranges[i] if i >= 0 and t < self.ranges[i][1] else None
+
+    def skip(self, t):
+        """t, or the end of the deleted range it falls in."""
+        r = self.containing(t)
+        return r[1] if r else t
+
+    def to_edit(self, t):
+        i = bisect.bisect_right(self._starts, t) - 1
+        if i < 0:
+            return t
+        a, b = self.ranges[i]
+        return a - self._before[i] if t < b else t - self._before[i + 1]
+
+    def to_source(self, e):
+        i = bisect.bisect_right(self._edit_starts, e) - 1
+        return e if i < 0 else e + self._before[i + 1]
+
+    def span(self, a, b):
+        """Length of source range a..b once the deleted bits are taken out."""
+        return self.to_edit(b) - self.to_edit(a)
+
+    def kept(self, a, b):
+        """The pieces of source range a..b that were not deleted."""
+        out, cur = [], a
+        for ra, rb in self.ranges:
+            if rb <= cur:
+                continue
+            if ra >= b:
+                break
+            if ra > cur:
+                out.append((cur, ra))
+            cur = max(cur, rb)
+        if cur < b:
+            out.append((cur, b))
+        return [(x, y) for x, y in out if y - x > 1e-6]
+
+
 # ---------------------------------------------------------------- timeline
 
 class Timeline(QWidget):
+    """Draws and edits everything in edit time; all times it takes and emits are source times."""
     seekRequested = Signal(float)
     selectionChanged = Signal(object)          # Segment or None
+    blocksChanged = Signal()                   # selected_blocks changed
     edgeDragStarted = Signal()
     edgeDragged = Signal()
     edgeDragFinished = Signal(object, str)     # Segment, "start" | "end"
 
     MARGIN = 10
     RULER_H = 24
+    CLIPS_H = 16
+    PARTS_H = 46
     EDGE_PX = 6
     TICK_STEPS = [0.1, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400]
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(100)
+        self.setMinimumHeight(200)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.NoFocus)
-        self.duration = 0.0
+        self.duration = 0.0                       # of the source
+        self.clips: list[tuple[float, float, str]] = []  # (start, end, file name) of each video
+        self.cuts = Cuts()
+        self.waveform: Waveform | None = None
+        self.wave_status = ""                     # e.g. "Reading audio… 40%", shown in the waveform lane
+        self.silences: list[tuple[float, float]] = []
+        self.selected_blocks: list[tuple[float, float]] = []  # silences picked for deletion
         self.segments: list[Segment] = []
         self.selected: Segment | None = None
         self.position = 0.0
         self.in_point = None
-        self.view_start = 0.0
+        self.view_start = 0.0                     # edit time
         self.view_len = 0.0
         self._drag = None  # ("seek",) or ("edge", segment, which)
 
     # -- view
+    @property
+    def edit_len(self):
+        return self.cuts.to_edit(self.duration)
+
     def set_duration(self, d):
         self.duration = d
-        self.view_start, self.view_len = 0.0, d
+        self.view_start, self.view_len = 0.0, self.edit_len
+        self.update()
+
+    def set_cuts(self, cuts):
+        self.cuts = cuts
+        self.view_len = min(self.view_len, self.edit_len)
+        self.view_start = self._clamp_view(self.view_start)
         self.update()
 
     def set_position(self, t):
         self.position = t
-        if self._drag is None and self.view_len < self.duration:
-            if not (self.view_start <= t <= self.view_start + self.view_len):
-                self.view_start = self._clamp_view(t - self.view_len * 0.1)
+        e = self.cuts.to_edit(t)
+        if self._drag is None and self.view_len < self.edit_len:
+            if not (self.view_start <= e <= self.view_start + self.view_len):
+                self.view_start = self._clamp_view(e - self.view_len * 0.1)
         self.update()
 
     def zoom(self, factor, anchor=None):
         if self.duration <= 0:
             return
-        anchor = self.position if anchor is None else anchor
+        anchor = self.cuts.to_edit(self.position if anchor is None else anchor)
         frac = (anchor - self.view_start) / self.view_len if self.view_len else 0.5
-        self.view_len = min(self.duration, max(2.0, self.view_len * factor))
+        self.view_len = min(self.edit_len, max(2.0, self.view_len * factor))
         self.view_start = self._clamp_view(anchor - frac * self.view_len)
         self.update()
 
     def zoom_fit(self):
-        self.view_start, self.view_len = 0.0, self.duration
+        self.view_start, self.view_len = 0.0, self.edit_len
         self.update()
 
     def _clamp_view(self, vs):
-        return min(max(0.0, vs), max(0.0, self.duration - self.view_len))
+        return min(max(0.0, vs), max(0.0, self.edit_len - self.view_len))
 
     def _plot_w(self):
         return max(1, self.width() - 2 * self.MARGIN)
 
-    def x_for(self, t):
+    def _lanes(self):
+        """(parts top, parts bottom, waveform top, waveform bottom)"""
+        top = self.RULER_H + self.CLIPS_H + 8
+        return top, top + self.PARTS_H, top + self.PARTS_H + 8, self.height() - 6
+
+    def _x_for_edit(self, e):
         if self.view_len <= 0:
             return float(self.MARGIN)
-        return self.MARGIN + (t - self.view_start) / self.view_len * self._plot_w()
+        return self.MARGIN + (e - self.view_start) / self.view_len * self._plot_w()
+
+    def x_for(self, t):
+        return self._x_for_edit(self.cuts.to_edit(t))
 
     def t_for(self, x):
         if self.view_len <= 0:
             return 0.0
-        t = self.view_start + (x - self.MARGIN) / self._plot_w() * self.view_len
-        return min(max(0.0, t), self.duration)
+        e = self.view_start + (x - self.MARGIN) / self._plot_w() * self.view_len
+        return min(self.cuts.to_source(min(max(0.0, e), self.edit_len)), self.duration)
 
     # -- painting
     def paintEvent(self, _):
@@ -249,7 +529,7 @@ class Timeline(QWidget):
         step = next((s for s in self.TICK_STEPS if s * self._plot_w() / self.view_len >= 90), self.TICK_STEPS[-1])
         for k in range(math.floor(self.view_start / step), math.ceil((self.view_start + self.view_len) / step) + 1):
             t = k * step
-            x = self.x_for(t)
+            x = self._x_for_edit(t)
             if self.MARGIN - 1 <= x <= w - self.MARGIN + 1:
                 p.setPen(QColor(110, 110, 120))
                 p.drawLine(QPointF(x, self.RULER_H - 7), QPointF(x, self.RULER_H))
@@ -257,7 +537,20 @@ class Timeline(QWidget):
                 label = f"{t:.1f}s" if step < 1 else fmt_time(t, ms=False)
                 p.drawText(QPointF(x + 3, self.RULER_H - 9), label)
 
-        top, bot = self.RULER_H + 8, h - 10
+        top, bot, wave_top, wave_bot = self._lanes()
+        strip_top = self.RULER_H + 3
+        for k, (a, b, name) in enumerate(self.clips):
+            x1, x2 = self.x_for(a), self.x_for(b)
+            if x2 < 0 or x1 > w:
+                continue
+            rect = QRectF(x1, strip_top, max(1.0, x2 - x1), self.CLIPS_H)
+            p.fillRect(rect, QColor(66, 66, 80) if k % 2 == 0 else QColor(52, 52, 64))
+            text_rect = rect.intersected(QRectF(0, 0, w, h)).adjusted(4, 0, -4, 0)
+            if text_rect.width() > 20:
+                p.setPen(QColor(200, 200, 210))
+                p.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft,
+                           p.fontMetrics().elidedText(name, Qt.ElideRight, int(text_rect.width())))
+        self._paint_wave(p, wave_top, wave_bot)
         visible = QRectF(0, 0, w, h)
         for i, seg in enumerate(self.segments):
             x1, x2 = self.x_for(seg.start), self.x_for(seg.end)
@@ -275,7 +568,21 @@ class Timeline(QWidget):
             if text_rect.width() > 24:
                 p.setPen(QColor(255, 255, 255))
                 p.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft,
-                           f"Part {i + 1}\n{fmt_time(seg.length, ms=False)}")
+                           f"Part {i + 1}\n{fmt_time(self.cuts.span(seg.start, seg.end), ms=False)}")
+
+        # Where one video file ends and the next starts.
+        p.setPen(QPen(QColor(170, 170, 185), 1))
+        for a, _, _ in self.clips[1:]:
+            x = self.x_for(a)
+            if self.MARGIN <= x <= w - self.MARGIN:
+                p.drawLine(QPointF(x, strip_top), QPointF(x, wave_bot))
+
+        # Where something was deleted: a thin marker at the join.
+        p.setPen(QPen(QColor(240, 190, 70), 1, Qt.DashLine))
+        for a, _ in self.cuts.ranges:
+            x = self.x_for(a)
+            if self.MARGIN <= x <= w - self.MARGIN:
+                p.drawLine(QPointF(x, top), QPointF(x, wave_bot))
 
         if self.in_point is not None:
             x = self.x_for(self.in_point)
@@ -290,6 +597,56 @@ class Timeline(QWidget):
         p.setBrush(QColor(240, 60, 60))
         p.drawPolygon(QPolygonF([QPointF(x - 6, 0), QPointF(x + 6, 0), QPointF(x, 8)]))
 
+    def _visible_silences(self):
+        t0, t1 = self.t_for(self.MARGIN - 2), self.t_for(self.width() - self.MARGIN + 2)
+        i = max(0, bisect.bisect_left(self.silences, (t0,)) - 1)
+        for a, b in self.silences[i:]:
+            if a > t1:
+                break
+            if b >= t0:
+                yield a, b
+
+    def _block_rect(self, a, b, top, bot):
+        x1, x2 = self.x_for(a), self.x_for(b)
+        return QRectF(x1 + 0.5, top + 2, max(2.0, x2 - x1 - 1), bot - top - 4)
+
+    def _paint_wave(self, p, top, bot):
+        lane = QRectF(self.MARGIN, top, self._plot_w(), bot - top)
+        p.fillRect(lane, QColor(20, 20, 24))
+        mid, half = (top + bot) / 2, (bot - top) / 2 - 1
+
+        p.save()
+        p.setClipRect(lane)
+        p.setRenderHint(QPainter.Antialiasing)
+        selected = set(self.selected_blocks)
+        for a, b in self._visible_silences():
+            rect = self._block_rect(a, b, top, bot)
+            radius = min(6.0, rect.width() / 2)
+            if (a, b) in selected:
+                p.setPen(QPen(QColor(255, 255, 255), 2))
+                p.setBrush(QColor(240, 70, 70, 200))
+            else:
+                p.setPen(QPen(QColor(255, 110, 110, 160), 1))
+                p.setBrush(QColor(230, 50, 50, 120))
+            p.drawRoundedRect(rect, radius, radius)
+        p.restore()
+
+        if self.waveform:
+            cols = int(self._plot_w())
+            dt = self.view_len / cols
+            edges = [self.cuts.to_source(self.view_start + c * dt) for c in range(cols + 1)]
+            peaks = self.waveform.column_peaks(edges, dt)
+            lines = []
+            for c, v in enumerate(peaks):
+                x, y = self.MARGIN + c + 0.5, max(0.5, BYTE_TO_HEIGHT[v] * half)
+                lines.append(QLineF(x, mid - y, x, mid + y))
+            p.setPen(QColor(120, 170, 225))
+            p.drawLines(lines)
+
+        if self.wave_status:
+            p.setPen(QColor(150, 150, 160))
+            p.drawText(lane.adjusted(8, 0, -8, 0), Qt.AlignVCenter | Qt.AlignRight, self.wave_status)
+
     # -- mouse
     def _hit_edge(self, x):
         candidates = ([self.selected] if self.selected in self.segments else []) + self.segments
@@ -301,6 +658,13 @@ class Timeline(QWidget):
 
     def _segment_at(self, t):
         return next((s for s in reversed(self.segments) if s.start <= t <= s.end), None)
+
+    def _block_at(self, x, y):
+        top, bot = self._lanes()[2:]
+        if not top <= y <= bot:
+            return None
+        return next((blk for blk in self._visible_silences()
+                     if self._block_rect(*blk, top, bot).adjusted(-2, 0, 2, 0).contains(QPointF(x, y))), None)
 
     def mousePressEvent(self, e):
         if self.duration <= 0 or e.button() != Qt.LeftButton:
@@ -316,10 +680,27 @@ class Timeline(QWidget):
                     self.selectionChanged.emit(self.selected)
                 self.update()
                 return
-            seg = self._segment_at(self.t_for(x))
-            if seg is not self.selected:
-                self.selected = seg
-                self.selectionChanged.emit(seg)
+            if y > self._lanes()[2]:
+                blk = self._block_at(x, y)
+                if e.modifiers() & Qt.ControlModifier:
+                    if blk in self.selected_blocks:
+                        self.selected_blocks.remove(blk)
+                    elif blk:
+                        self.selected_blocks.append(blk)
+                else:
+                    self.selected_blocks = [blk] if blk else []
+                if self.selected_blocks and self.selected is not None:
+                    self.selected = None
+                    self.selectionChanged.emit(None)
+                self.blocksChanged.emit()
+            else:
+                seg = self._segment_at(self.t_for(x))
+                if seg is not self.selected:
+                    self.selected = seg
+                    self.selectionChanged.emit(seg)
+                if self.selected_blocks:
+                    self.selected_blocks = []
+                    self.blocksChanged.emit()
         self._drag = ("seek",)
         self.seekRequested.emit(self.t_for(x))
         self.update()
@@ -329,6 +710,8 @@ class Timeline(QWidget):
         if self._drag is None:
             if e.position().y() > self.RULER_H and self._hit_edge(x):
                 self.setCursor(Qt.SizeHorCursor)
+            elif self._block_at(x, e.position().y()):
+                self.setCursor(Qt.PointingHandCursor)
             else:
                 self.unsetCursor()
             return
@@ -365,19 +748,24 @@ class Timeline(QWidget):
 # ---------------------------------------------------------------- export
 
 class Exporter(QObject):
-    """Runs one ffmpeg stream-copy job per part, one after another."""
+    """Runs one ffmpeg stream-copy job per part, one after another.
+
+    A part made of several pieces (because blocks were deleted from it) is joined in the same pass
+    with the concat demuxer, still without re-encoding.
+    """
     progress = Signal(float, int, int)  # overall fraction, current job index, job count
     done = Signal(bool, str)
 
-    def __init__(self, ffmpeg, src, jobs, parent=None):
+    def __init__(self, ffmpeg, jobs, parent=None):
         super().__init__(parent)
-        self.ffmpeg, self.src, self.jobs = ffmpeg, src, jobs  # jobs: [(start, length, out_path)]
+        self.ffmpeg, self.jobs = ffmpeg, jobs  # jobs: [([(file, start, end), ...], length, out_path)]
         self.total = sum(j[1] for j in jobs) or 1.0
         self.index = 0
         self.done_len = 0.0
         self.cancelled = False
         self.proc = None
         self._buf = ""
+        self._list_file = None
 
     def start(self):
         self._next()
@@ -391,14 +779,24 @@ class Exporter(QObject):
         if self.index >= len(self.jobs):
             self.done.emit(True, f"Exported {len(self.jobs)} part(s).")
             return
-        start, length, out = self.jobs[self.index]
+        pieces, length, out = self.jobs[self.index]
         self.progress.emit(self.done_len / self.total, self.index, len(self.jobs))
         self._buf = ""
+        if len(pieces) == 1:
+            src, start, _ = pieces[0]
+            inputs = ["-ss", f"{start:.6f}", "-i", src, "-t", f"{length:.6f}"]
+        else:
+            fd, self._list_file = tempfile.mkstemp(prefix="videocutter-", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("ffconcat version 1.0\n")
+                for src, a, b in pieces:
+                    src = src.replace("\\", "/").replace("'", r"'\''")
+                    f.write(f"file '{src}'\ninpoint {a:.6f}\noutpoint {b:.6f}\n")
+            inputs = ["-f", "concat", "-safe", "0", "-i", self._list_file]
         self.proc = QProcess(self)
         self.proc.setProgram(self.ffmpeg)
         self.proc.setArguments([
-            "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-            "-ss", f"{start:.6f}", "-i", self.src, "-t", f"{length:.6f}",
+            "-hide_banner", "-nostdin", "-loglevel", "error", "-y", *inputs,
             "-map", "0:v?", "-map", "0:a?", "-c", "copy",
             "-avoid_negative_ts", "make_zero",
             "-progress", "pipe:1", "-nostats", out,
@@ -423,6 +821,9 @@ class Exporter(QObject):
 
     def _on_finished(self, code, _status):
         out = self.jobs[self.index][2]
+        if self._list_file:
+            Path(self._list_file).unlink(missing_ok=True)
+            self._list_file = None
         if self.cancelled:
             Path(out).unlink(missing_ok=True)
             self.done.emit(False, "Export cancelled.")
@@ -448,12 +849,20 @@ class MainWindow(QMainWindow):
         self.ffmpeg = shutil.which("ffmpeg")
         self.ffprobe = shutil.which("ffprobe")
 
-        self.path = None
-        self.info = {}
+        self.clips: list[Clip] = []
+        self._offsets: list[float] = []  # where each clip starts on the timeline
+        self.path = None  # first clip's file; names the exports
+        self.info = {}    # first clip's info, with the size of all clips together
         self.duration = 0.0
         self.segments: list[Segment] = []
+        self.cuts = Cuts()  # deleted blocks
         self.pos = 0.0
         self.exporter = None
+        self._wave_loaders = {}  # path -> WaveformLoader; kept, so reordering never re-reads audio
+        self._wave = None
+        self._cur_clip = -1        # the clip loaded in the player
+        self._pending_local = None  # position to apply once the player has loaded that clip
+        self._resume_play = False
         self._updating_table = False
         self._pending_seek = None
         self._undo = []  # snapshots from _snapshot()
@@ -468,6 +877,7 @@ class MainWindow(QMainWindow):
         self.player.setVideoOutput(self.video)
         self.player.positionChanged.connect(self._on_player_position)
         self.player.playbackStateChanged.connect(self._on_play_state)
+        self.player.mediaStatusChanged.connect(self._on_media_status)
         self.player.errorOccurred.connect(lambda _e, msg: self.statusBar().showMessage(f"Playback error: {msg}"))
 
         # Scrubbing fires lots of seeks; only hand the player the latest one every 40 ms.
@@ -534,6 +944,7 @@ class MainWindow(QMainWindow):
         self.timeline.edgeDragStarted.connect(self._push_undo)
         self.timeline.edgeDragged.connect(self._refresh_table)
         self.timeline.edgeDragFinished.connect(self._on_edge_drag_finished)
+        self.timeline.blocksChanged.connect(self._on_blocks_changed)
 
         top = QWidget()
         top_layout = QVBoxLayout(top)
@@ -541,6 +952,7 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.video, 1)
         top_layout.addLayout(controls)
         top_layout.addWidget(self.timeline)
+        top_layout.addLayout(self._build_silence_row())
 
         # parts table
         self.table = QTableWidget(0, 6)
@@ -562,7 +974,7 @@ class MainWindow(QMainWindow):
         self.parts_label = QLabel()
         table_header.addWidget(self.parts_label)
         table_header.addStretch()
-        table_header.addWidget(self._button("Delete part", self.delete_selected, "Delete the selected part (Delete)"))
+        table_header.addWidget(self._button("Delete part", self.delete_part, "Delete the selected part (Delete)"))
         table_header.addWidget(self._button("Clear all", self.clear_parts))
         table_box.addLayout(table_header)
         table_box.addWidget(self.table)
@@ -610,7 +1022,12 @@ class MainWindow(QMainWindow):
         bottom = QWidget()
         bottom_layout = QHBoxLayout(bottom)
         bottom_layout.setContentsMargins(8, 4, 8, 8)
-        bottom_layout.addLayout(table_box, 1)
+        parts_tab = QWidget()
+        parts_tab.setLayout(table_box)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(parts_tab, "Parts")
+        self.tabs.addTab(self._build_files_tab(), "Videos")
+        bottom_layout.addWidget(self.tabs, 1)
         bottom_layout.addWidget(panel_widget)
 
         splitter = QSplitter(Qt.Vertical)
@@ -620,6 +1037,96 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([620, 260])
         self.setCentralWidget(splitter)
+
+    def _build_files_tab(self):
+        self.files_table = QTableWidget(0, 6)
+        self.files_table.setHorizontalHeaderLabels(["#", "File", "Created", "Length", "Size", "Format"])
+        self.files_table.verticalHeader().setVisible(False)
+        self.files_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.files_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.files_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.files_table.setAlternatingRowColors(True)
+        hdr = self.files_table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        self.files_table.cellDoubleClicked.connect(lambda row, _col: self.seek(self._offsets[row]))
+
+        header = QHBoxLayout()
+        self.files_label = QLabel()
+        header.addWidget(self.files_label)
+        header.addStretch()
+        header.addWidget(self._button("Add videos…", self.add_dialog, "Add videos to the end of the timeline (Ctrl+Shift+O)"))
+        header.addWidget(self._button("Sort by date created", self.sort_by_created,
+                                      "Put the videos on the timeline in the order their files were created"))
+        header.addWidget(self._button("▲", lambda: self.move_clip(-1), "Move the selected video earlier"))
+        header.addWidget(self._button("▼", lambda: self.move_clip(1), "Move the selected video later"))
+        header.addWidget(self._button("Remove", self.remove_clip, "Take the selected video off the timeline"))
+
+        self.files_warning = QLabel()
+        self.files_warning.setWordWrap(True)
+        self.files_warning.setStyleSheet("color: rgb(240, 190, 70);")
+        hint = QLabel("The videos play back to back on the timeline, top to bottom. Double-click one to jump to it.")
+        hint.setStyleSheet("color: gray;")
+
+        box = QVBoxLayout()
+        box.addLayout(header)
+        box.addWidget(self.files_table)
+        box.addWidget(self.files_warning)
+        box.addWidget(hint)
+        tab = QWidget()
+        tab.setLayout(box)
+        return tab
+
+    def _build_silence_row(self):
+        self.silence_btn = self._button("Highlight silence", self._update_silences,
+                                        "Mark in red where the audio is (nearly) silent")
+        self.silence_btn.setCheckable(True)
+        self.silence_btn.setStyleSheet("QPushButton:checked { background: rgb(170, 45, 45); }")
+        self.silence_btn.setChecked(self.settings.value("silence_on", False, type=bool))
+
+        self.silence_len = QDoubleSpinBox()
+        self.silence_len.setRange(0.05, 600)
+        self.silence_len.setDecimals(2)
+        self.silence_len.setSingleStep(0.25)
+        self.silence_len.setSuffix(" s")
+        self.silence_len.setValue(self.settings.value("silence_min", 10.0, type=float))
+        self.silence_len.setToolTip("Quiet stretches shorter than this are ignored")
+
+        self.silence_db = QSpinBox()
+        self.silence_db.setRange(-90, -10)
+        self.silence_db.setSuffix(" dB")
+        self.silence_db.setValue(self.settings.value("silence_db", -50, type=int))
+        self.silence_db.setToolTip("Audio quieter than this counts as silence.\n"
+                                   "Raise it (e.g. -40) if background noise keeps silence from being found.")
+
+        for box in (self.silence_len, self.silence_db):
+            box.setKeyboardTracking(False)
+            box.setFocusPolicy(Qt.ClickFocus)  # don't take the keyboard at startup
+            box.valueChanged.connect(self._update_silences)
+            box.editingFinished.connect(box.clearFocus)  # give the keyboard back to the shortcuts
+
+        self.silence_label = QLabel()
+        self.silence_label.setStyleSheet("color: gray;")
+        self.silence_label.setMinimumWidth(240)
+        self.select_blocks_btn = self._button("Select all", self.select_all_blocks,
+                                              "Select every red block (Ctrl+A). Ctrl+click a block to add or remove it.")
+        self.delete_blocks_btn = self._button("Delete blocks", self.delete_blocks,
+                                              "Cut the selected blocks out of the video and close the gaps (Delete)")
+
+        row = QHBoxLayout()
+        row.addWidget(self.silence_btn)
+        row.addSpacing(8)
+        row.addWidget(QLabel("At least"))
+        row.addWidget(self.silence_len)
+        row.addSpacing(8)
+        row.addWidget(QLabel("Quieter than"))
+        row.addWidget(self.silence_db)
+        row.addSpacing(12)
+        row.addWidget(self.silence_label)
+        row.addStretch()
+        row.addWidget(self.select_blocks_btn)
+        row.addWidget(self.delete_blocks_btn)
+        return row
 
     def _build_actions(self):
         menu_file = self.menuBar().addMenu("&File")
@@ -637,7 +1144,8 @@ class MainWindow(QMainWindow):
                 menu.addAction(a)
             return a
 
-        act(menu_file, "&Open video…", "Ctrl+O", self.open_dialog)
+        act(menu_file, "&Open videos…", "Ctrl+O", self.open_dialog)
+        act(menu_file, "&Add videos…", "Ctrl+Shift+O", self.add_dialog)
         act(menu_file, "&Export parts", "Ctrl+E", self.export)
         menu_file.addSeparator()
         act(menu_file, "E&xit", "Ctrl+Q", self.close)
@@ -649,7 +1157,8 @@ class MainWindow(QMainWindow):
         act(menu_edit, "Split into N equal parts…", "N", self.split_into_n)
         act(menu_edit, "Set in point", "I", self.set_in)
         act(menu_edit, "Set out point (adds part)", "O", self.set_out)
-        act(menu_edit, "Delete selected part", "Delete", self.delete_selected)
+        act(menu_edit, "Delete selected part / blocks", "Delete", self.delete_selected)
+        act(menu_edit, "Select all silent blocks", "Ctrl+A", self.select_all_blocks)
         act(menu_edit, "Clear all parts", None, self.clear_parts)
         act(None, "Clear in point / selection", "Esc", self.clear_marks)
 
@@ -684,47 +1193,182 @@ class MainWindow(QMainWindow):
         return False
 
     def open_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open video", self.settings.value("last_dir", ""),
-                                              f"Video files ({VIDEO_EXTS});;All files (*)")
-        if path:
-            self.load(path)
+        self._pick_files(add=False)
 
-    def load(self, path):
+    def add_dialog(self):
+        self._pick_files(add=bool(self.clips))
+
+    def _pick_files(self, add):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add videos" if add else "Open videos",
+                                                self.settings.value("last_dir", ""),
+                                                f"Video files ({VIDEO_EXTS});;All files (*)")
+        if paths:
+            self.open_files(paths, add)
+
+    def open_files(self, paths, add=False):
+        """Open videos onto the timeline, replacing what's there, or appending them when add is True."""
         if self.exporter:
             QMessageBox.information(self, APP_NAME, "Wait for the export to finish first.")
             return
         if not self._check_tools():
             return
-        if self.segments and QMessageBox.question(
-                self, APP_NAME, "Discard the current parts and open a new video?") != QMessageBox.Yes:
+        if not add and (self.segments or self.cuts) and QMessageBox.question(
+                self, APP_NAME, "Discard the current parts and open new videos?") != QMessageBox.Yes:
             return
+        have = {os.path.normcase(os.path.abspath(c.path)) for c in self.clips} if add else set()
+        new, errors = [], []
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            info = probe(self.ffprobe, path)
-        except Exception as e:
+            for path in paths:
+                key = os.path.normcase(os.path.abspath(path))
+                if key in have:
+                    errors.append(f"{Path(path).name}: already on the timeline")
+                    continue
+                try:
+                    info = probe(self.ffprobe, path)
+                except Exception as e:
+                    errors.append(f"{Path(path).name}: {e}")
+                    continue
+                if info["duration"] <= 0:
+                    errors.append(f"{Path(path).name}: couldn't determine its duration")
+                    continue
+                have.add(key)
+                new.append(Clip(path, info))
+        finally:
             QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, APP_NAME, f"Could not read this file:\n\n{e}")
-            return
-        QApplication.restoreOverrideCursor()
-        if info["duration"] <= 0:
-            QMessageBox.critical(self, APP_NAME, "Could not determine the video's duration.")
+        if errors:
+            QMessageBox.warning(self, APP_NAME, "Some files were skipped:\n\n" + "\n".join(errors[:15]))
+        if not new:
             return
 
-        self.path, self.info, self.duration = path, info, info["duration"]
+        if add:
+            self.clips.extend(new)  # appending leaves every existing time where it was
+        else:
+            self.clips[:] = new
+            self.segments.clear()
+            self._undo.clear()
+            self._redo.clear()
+            self.timeline.selected = None
+            self.timeline.in_point = None
+            self.timeline.selected_blocks = []
+            self._set_cuts(Cuts())
+            self.pos = 0.0
+        if not add or not self.out_edit.text().strip():
+            self.out_edit.setText(str(Path(new[0].path).parent))
+        self.settings.setValue("last_dir", str(Path(new[-1].path).parent))
+        self._clips_changed()
+        self.statusBar().showMessage(
+            f"Added {len(new)} video{'s' if len(new) != 1 else ''}." if add else
+            "Loaded. Press S to split at the playhead, or I / O to mark a part.", 8000)
+
+    def _clips_changed(self):
+        """Rebuild everything that depends on which videos are on the timeline and in what order."""
+        self._offsets = list(itertools.accumulate((c.duration for c in self.clips), initial=0.0))
+        self.duration = self._offsets.pop() if self.clips else 0.0
+        first = self.clips[0] if self.clips else None
+        self.path = first.path if first else None
+        self.info = dict(first.info, size=sum(c.info["size"] for c in self.clips)) if first else {}
+        self.timeline.clips = [(off, off + c.duration, c.name) for off, c in zip(self._offsets, self.clips)]
+        self.timeline.set_duration(self.duration)
+        self._cur_clip, self._pending_local = -1, None
+        if not self.clips:
+            self.player.stop()
+            self.player.setSource(QUrl())
+        self.setWindowTitle(f"{first.name}{f' + {len(self.clips) - 1} more' if len(self.clips) > 1 else ''}"
+                            f" — {APP_NAME}" if first else APP_NAME)
+        self._reset_waveform()
+        self._refresh_files()
+        self._refresh_all()
+        self.pos = min(self.pos, self.duration)
+        if self.clips:
+            self._player_seek(self.pos, play=False)
+            self.timeline.set_position(self.pos)
+
+    def _refresh_files(self):
+        t = self.files_table
+        t.setRowCount(len(self.clips))
+        for i, c in enumerate(self.clips):
+            created = datetime.datetime.fromtimestamp(c.info["created"]).strftime("%Y-%m-%d  %H:%M:%S")
+            values = [str(i + 1), c.name, created, fmt_time(c.duration, ms=False), fmt_size(c.info["size"]), c.format]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setTextAlignment(Qt.AlignCenter)
+                elif col in (3, 4):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if col == 1:
+                    item.setToolTip(c.path)
+                t.setItem(i, col, item)
+        n = len(self.clips)
+        self.tabs.setTabText(1, f"Videos ({n})" if n else "Videos")
+        self.files_label.setText(f"<b>{n} video{'s' if n != 1 else ''}</b>  ·  {fmt_time(self.duration, ms=False)}"
+                                 if n else "<b>Videos</b> — open or drop videos to put them on the timeline")
+        formats = {(c.info["vcodec"], c.info["width"], c.info["height"], round(c.info["fps"], 2), c.info["acodec"])
+                   for c in self.clips}
+        self.files_warning.setText(
+            "⚠ These videos aren't all the same format (codec, size or frame rate). Exporting anything that "
+            "spans more than one of them without re-encoding will probably give a broken file." if len(formats) > 1 else "")
+        self.files_warning.setVisible(len(formats) > 1)
+
+    def _selected_clip(self):
+        rows = self.files_table.selectionModel().selectedRows()
+        return rows[0].row() if rows else None
+
+    def _set_clip_order(self, clips, select=None):
+        """Change which videos are on the timeline or their order. Parts and deleted blocks can't follow."""
+        if clips == self.clips:
+            return False
+        if (self.segments or self.cuts or self.timeline.in_point is not None) and QMessageBox.question(
+                self, APP_NAME, "Changing the videos or their order clears your parts and deleted blocks, "
+                                "and this can't be undone. Continue?") != QMessageBox.Yes:
+            return False
         self.segments.clear()
         self._undo.clear()
         self._redo.clear()
         self.timeline.selected = None
         self.timeline.in_point = None
-        self.timeline.set_duration(self.duration)
-        self.out_edit.setText(str(Path(path).parent))
-        self.settings.setValue("last_dir", str(Path(path).parent))
-        self.setWindowTitle(f"{Path(path).name} — {APP_NAME}")
-        self.player.setSource(QUrl.fromLocalFile(path))
-        self.player.pause()  # shows the first frame
+        self.timeline.selected_blocks = []
+        self._set_cuts(Cuts())
+        self.clips[:] = clips
         self.pos = 0.0
-        self._refresh_all()
-        self.statusBar().showMessage("Loaded. Press S to split at the playhead, or I / O to mark a part.", 8000)
+        self._clips_changed()
+        if select is not None:
+            self.files_table.selectRow(select)
+        return True
+
+    def sort_by_created(self):
+        ordered = sorted(self.clips, key=lambda c: c.info["created"])
+        if ordered == self.clips:
+            self.statusBar().showMessage("The videos are already in the order they were created.", 4000)
+        elif self._set_clip_order(ordered):
+            self.statusBar().showMessage("Sorted the videos by date created.", 4000)
+
+    def move_clip(self, step):
+        i = self._selected_clip()
+        if i is None or not 0 <= i + step < len(self.clips):
+            return
+        clips = list(self.clips)
+        clips[i], clips[i + step] = clips[i + step], clips[i]
+        self._set_clip_order(clips, select=i + step)
+
+    def remove_clip(self):
+        i = self._selected_clip()
+        if i is not None:
+            self._set_clip_order(self.clips[:i] + self.clips[i + 1:])
+
+    def _clip_at(self, t):
+        """(index of the clip playing at timeline time t, time within that clip)"""
+        i = min(max(0, bisect.bisect_right(self._offsets, t) - 1), len(self.clips) - 1)
+        return i, t - self._offsets[i]
+
+    def _file_pieces(self, a, b):
+        """Timeline range a..b as (file, start, end) pieces, split where one file ends and the next starts."""
+        out = []
+        for off, c in zip(self._offsets, self.clips):
+            lo, hi = max(a, off), min(b, off + c.duration)
+            if hi - lo > 1e-6:
+                out.append((c.path, lo - off, hi - off))
+        return out
 
     def browse_output(self):
         d = QFileDialog.getExistingDirectory(self, "Output folder", self.out_edit.text())
@@ -741,6 +1385,178 @@ class MainWindow(QMainWindow):
         d = self._output_dir()
         if d and d.is_dir():
             os.startfile(d)
+
+    # -- waveform / silence
+    def _stop_waveform(self):
+        for loader in self._wave_loaders.values():
+            loader.cancel()
+            loader.deleteLater()
+        self._wave_loaders.clear()
+
+    def _reset_waveform(self):
+        """Start the timeline's waveform over, reusing whatever audio was already read for each file."""
+        self._wave = Waveform() if self.clips else None
+        self._wave_k, self._wave_taken = 0, 0  # clips fully copied in, bytes copied from the next one
+        self.timeline.waveform = self._wave
+        self._wave_clock = QElapsedTimer()
+        self._wave_clock.start()
+        self._pump_wave_loaders()
+        self._extend_waveform()
+
+    def _pump_wave_loaders(self):
+        """Read one file's audio at a time, in timeline order."""
+        if any(not ld.complete for ld in self._wave_loaders.values()):
+            return
+        for c in self.clips:
+            if c.path not in self._wave_loaders:
+                loader = WaveformLoader(self.ffmpeg, c.path, self)
+                loader.updated.connect(self._extend_waveform)
+                loader.done.connect(self._on_wave_loader_done)
+                self._wave_loaders[c.path] = loader
+                loader.start()
+                return
+
+    def _on_wave_loader_done(self, *_):
+        self._pump_wave_loaders()
+        self._extend_waveform()
+
+    def _extend_waveform(self):
+        """Copy newly read audio into the timeline's waveform, file by file in timeline order."""
+        wave = self._wave
+        if wave is None:
+            return
+        while self._wave_k < len(self.clips):
+            clip = self.clips[self._wave_k]
+            loader = self._wave_loaders.get(clip.path)
+            if loader is None:
+                break
+            target = round(clip.duration * Waveform.RATE)  # exactly the clip's length, so files line up
+            data = loader.wave.levels[0]
+            avail = min(len(data), target)
+            if avail > self._wave_taken:
+                wave.append(bytes(data[self._wave_taken:avail]))
+                self._wave_taken = avail
+            if not loader.complete:
+                break
+            if self._wave_taken < target:
+                wave.append(bytes(target - self._wave_taken))
+            self._wave_k += 1
+            self._wave_taken = 0
+        done = self._wave_k >= len(self.clips)
+        self.timeline.wave_status = "" if done else \
+            f"Reading audio… {min(99, wave.loaded / max(self.duration, 1e-9) * 100):.0f}%"
+        if done or self._wave_clock.elapsed() > 1000:  # keep the silence marks current without redoing them constantly
+            self._wave_clock.restart()
+            self._update_silences()
+        self.timeline.update()
+
+    def _update_silences(self, *_):
+        on = self.silence_btn.isChecked()
+        self.settings.setValue("silence_on", on)
+        self.settings.setValue("silence_min", self.silence_len.value())
+        self.settings.setValue("silence_db", self.silence_db.value())
+        wave = self.timeline.waveform
+        min_len = self.silence_len.value()
+        sil = wave.silences(self.silence_db.value(), min_len) if on and wave else []
+        if self.cuts:  # leave out what was already deleted
+            sil = [piece for a, b in sil for piece in self.cuts.kept(a, b) if piece[1] - piece[0] >= min_len]
+        self.timeline.silences = sil
+        keep = set(sil)
+        self.timeline.selected_blocks = [b for b in self.timeline.selected_blocks if b in keep]
+        if not on or not wave:
+            self.silence_label.setText("")
+        elif sil:
+            total = sum(b - a for a, b in sil)
+            self.silence_label.setText(f"{len(sil)} silent stretch{'es' if len(sil) != 1 else ''} · "
+                                       f"{fmt_time(total, ms=False)} total")
+        else:
+            self.silence_label.setText("No silence found")
+        self._on_blocks_changed()
+
+    def _on_blocks_changed(self):
+        blocks = self.timeline.selected_blocks
+        self.select_blocks_btn.setEnabled(bool(self.timeline.silences))
+        self.delete_blocks_btn.setEnabled(bool(blocks))
+        self.delete_blocks_btn.setText(f"Delete {len(blocks)} block{'s' if len(blocks) != 1 else ''}"
+                                       if blocks else "Delete blocks")
+        if blocks:
+            self._sync_table_selection()
+        self.timeline.update()
+
+    def select_all_blocks(self):
+        if not self.timeline.silences:
+            self.statusBar().showMessage("Turn on Highlight silence to get blocks to select.", 4000)
+            return
+        self.timeline.selected_blocks = list(self.timeline.silences)
+        self.timeline.selected = None
+        self._on_blocks_changed()
+
+    def _set_cuts(self, cuts):
+        self.cuts = cuts
+        self.timeline.set_cuts(cuts)
+
+    def delete_blocks(self):
+        """Cut the selected silent blocks out of the video, so what's left and right of each joins up."""
+        blocks = sorted(self.timeline.selected_blocks)
+        if not blocks or not self._has_media():
+            return
+        # The video after a block has to restart on a keyframe, so end each cut on the last keyframe
+        # inside the block. That keeps a little of the silence but never touches the sound around it.
+        snap = self.snap_cb.isChecked()
+        ranges, skipped = [], 0
+        if snap:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for a, b in blocks:
+                if snap and b < self.duration - 0.001:
+                    end = self._clean_restart(a, b)
+                    if end is None or end - a < 0.05:
+                        skipped += 1
+                        continue
+                    b = end
+                ranges.append((a, b))
+        finally:
+            if snap:
+                QApplication.restoreOverrideCursor()
+
+        if ranges:
+            self._push_undo()
+            self._set_cuts(self.cuts.add(ranges))
+            for seg in list(self.segments):
+                seg.start = self.cuts.skip(seg.start)
+                inside = self.cuts.containing(seg.end - 1e-6)
+                if inside:
+                    seg.end = inside[0]
+                if self.cuts.span(seg.start, seg.end) < 0.05:
+                    self.segments.remove(seg)
+            if self.timeline.in_point is not None:
+                self.timeline.in_point = self.cuts.skip(self.timeline.in_point)
+            self.timeline.selected_blocks = []
+            self._update_silences()
+            self.seek(self.pos)
+            self._parts_changed()
+        removed = sum(b - a for a, b in ranges)
+        msg = f"Deleted {len(ranges)} block{'s' if len(ranges) != 1 else ''} ({fmt_time(removed)})."
+        if skipped:
+            msg += (f" {skipped} had no keyframe inside, so they can't be cut cleanly — "
+                    "turn off 'Snap cuts to keyframes' to delete them anyway.")
+        self.statusBar().showMessage(msg, 10000)
+
+    def _clean_restart(self, a, b):
+        """The latest point in a..b where playback can restart without re-encoding, or None."""
+        i, local = self._clip_at(b)
+        if local < 1e-3:
+            return b  # the start of a file
+        clip, off = self.clips[i], self._offsets[i]
+        if not clip.info["vcodec"]:
+            return b  # audio only: any point will do
+        try:
+            kf = last_keyframe_in(self.ffprobe, clip.path, max(0.0, a - off), local)
+        except Exception:
+            kf = None
+        if kf is not None:
+            return off + kf
+        return off if a < off else None
 
     # -- playback
     def _has_media(self):
@@ -765,7 +1581,7 @@ class MainWindow(QMainWindow):
     def seek(self, t):
         if not self._has_media():
             return
-        self.pos = min(max(0.0, t), self.duration)
+        self.pos = self.cuts.skip(min(max(0.0, t), self.duration))
         self.timeline.set_position(self.pos)
         self._update_time_label()
         self._pending_seek = self.pos
@@ -774,27 +1590,82 @@ class MainWindow(QMainWindow):
 
     def _apply_seek(self):
         if self._pending_seek is not None:
-            self.player.setPosition(int(round(self._pending_seek * 1000)))
+            self._player_seek(self._pending_seek)
             self._pending_seek = None
+
+    def _player_seek(self, t, play=None):
+        """Show timeline time t in the player, switching to the right file if needed."""
+        i, local = self._clip_at(t)
+        if i != self._cur_clip:
+            self._resume_play = self.player.playbackState() == QMediaPlayer.PlayingState if play is None else play
+            self._cur_clip, self._pending_local = i, local
+            self.player.stop()  # switching while playing would start the new file from 0
+            self.player.setSource(QUrl.fromLocalFile(self.clips[i].path))
+            if self._pending_local is not None:  # not loaded yet: this loads it and shows a frame
+                self.player.pause()
+        elif self._pending_local is not None:
+            self._pending_local = local
+        else:
+            self.player.setPosition(int(round(local * 1000)))
+            if play:
+                self.player.play()
+
+    def _apply_pending_local(self):
+        ready = (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferingMedia, QMediaPlayer.BufferedMedia)
+        if self._pending_local is None or self.player.mediaStatus() not in ready:
+            return  # the next status change will try again
+        local, self._pending_local = self._pending_local, None
+        # A freshly loaded file is "stopped", which ignores positions; and playing right after
+        # a seek restarts from 0. So get it paused or playing first, then seek.
+        if self._resume_play:
+            self.player.play()
+        else:
+            self.player.pause()
+        self.player.setPosition(int(round(local * 1000)))
+        self._resume_play = False
+
+    def _on_media_status(self, status):
+        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia) and self._pending_local is not None:
+            # Not from inside the player's own signal: a position set there gets lost.
+            QTimer.singleShot(0, self._apply_pending_local)
+        elif status == QMediaPlayer.EndOfMedia and 0 <= self._cur_clip < len(self.clips) - 1:
+            nxt = self.cuts.skip(self._offsets[self._cur_clip + 1])  # carry on with the next file
+            if nxt < self.duration:
+                self.pos = nxt
+                self.timeline.set_position(nxt)
+                self._update_time_label()
+                self._player_seek(nxt, play=True)
 
     def _on_player_position(self, ms):
         # Ignore stale positions while a seek is pending or the user is dragging.
-        if self._seek_timer.isActive() or self.timeline._drag is not None:
+        if self._seek_timer.isActive() or self.timeline._drag is not None or self._pending_local is not None:
             return
-        self.pos = ms / 1000
+        if not 0 <= self._cur_clip < len(self.clips):
+            return
+        i = self._cur_clip
+        self.pos = min(self._offsets[i] + ms / 1000, self._offsets[i] + self.clips[i].duration)
+        deleted = self.cuts.containing(self.pos)
+        if deleted and self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.pos = deleted[1]
+            self._player_seek(min(self.duration, deleted[1] + 0.02))  # hop over the deleted block
         self.timeline.set_position(self.pos)
         self._update_time_label()
 
+    def _edit_seek(self, e):
+        """Seek to a time on the edited (shortened) video."""
+        self.seek(self.cuts.to_source(min(max(0.0, e), self.cuts.to_edit(self.duration))))
+
     def nudge(self, seconds):
-        self.seek(self.pos + seconds)
+        self._edit_seek(self.cuts.to_edit(self.pos) + seconds)
 
     def step_frames(self, n):
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause()
-        self.seek(self.pos + n / self.info.get("fps", 30.0))
+        self._edit_seek(self.cuts.to_edit(self.pos) + n / self.info.get("fps", 30.0))
 
     def jump_cut(self, direction):
-        points = sorted({0.0, self.duration, *(s.start for s in self.segments), *(s.end for s in self.segments)}
+        points = sorted({0.0, self.duration, *(s.start for s in self.segments), *(s.end for s in self.segments),
+                         *(b for _, b in self.cuts.ranges)}
                         | ({self.timeline.in_point} if self.timeline.in_point is not None else set()))
         if direction < 0:
             target = next((p for p in reversed(points) if p < self.pos - 0.01), 0.0)
@@ -806,21 +1677,21 @@ class MainWindow(QMainWindow):
         if not self._has_media():
             return
         text, ok = QInputDialog.getText(self, "Go to time", "Time (h:mm:ss.ms, mm:ss, or seconds):",
-                                        text=fmt_time(self.pos))
+                                        text=fmt_time(self.cuts.to_edit(self.pos)))
         if ok:
             t = parse_time(text)
             if t is None:
                 self.statusBar().showMessage("Couldn't read that time.", 4000)
             else:
-                self.seek(t)
+                self._edit_seek(t)
 
     def _update_time_label(self):
-        self.time_label.setText(f"{fmt_time(self.pos)} / {fmt_time(self.duration)}")
+        self.time_label.setText(f"{fmt_time(self.cuts.to_edit(self.pos))} / {fmt_time(self.cuts.to_edit(self.duration))}")
 
     # -- undo / redo
     def _snapshot(self):
         sel = self.timeline.selected
-        return ([(s.start, s.end, s.name) for s in self.segments], self.timeline.in_point,
+        return ([(s.start, s.end, s.name) for s in self.segments], self.timeline.in_point, self.cuts.ranges,
                 self.segments.index(sel) if sel in self.segments else -1)
 
     def _push_undo(self):
@@ -831,15 +1702,19 @@ class MainWindow(QMainWindow):
 
     def _drop_noop_undo(self):
         """Undo the last _push_undo if nothing actually changed since."""
-        if self._undo and self._undo[-1][:2] == self._snapshot()[:2]:
+        if self._undo and self._undo[-1][:3] == self._snapshot()[:3]:
             self._undo.pop()
             self._redo = self._redo_before_push
 
     def _restore(self, snap):
-        parts, in_point, sel = snap
+        parts, in_point, cuts, sel = snap
         self.segments[:] = [Segment(*p) for p in parts]
         self.timeline.in_point = in_point
         self.timeline.selected = self.segments[sel] if 0 <= sel < len(self.segments) else None
+        if cuts != self.cuts.ranges:
+            self._set_cuts(Cuts(cuts))
+            self._update_silences()
+            self.seek(self.pos)
         self._refresh_all()
 
     def undo(self):
@@ -863,14 +1738,20 @@ class MainWindow(QMainWindow):
         """Move t to the nearest keyframe (if snapping is on), so stream-copy cuts are exact."""
         if not self.snap_cb.isChecked() or t <= 0.001 or t >= self.duration - 0.001:
             return t
+        i, local = self._clip_at(t)
+        clip, off = self.clips[i], self._offsets[i]
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            kf = nearest_keyframe(self.ffprobe, self.path, t)
+            kf = nearest_keyframe(self.ffprobe, clip.path, local)
         except Exception:
             kf = None
         finally:
             QApplication.restoreOverrideCursor()
-        return t if kf is None else min(max(0.0, kf), self.duration)
+        if kf is None:
+            return self.cuts.skip(t)
+        # The start of each file is a clean cut point too.
+        return self.cuts.skip(min((off + min(max(0.0, kf), clip.duration), off, off + clip.duration),
+                                  key=lambda c: abs(c - t)))
 
     def _parts_changed(self, select=None):
         self.segments.sort(key=lambda s: (s.start, s.end))
@@ -913,11 +1794,12 @@ class MainWindow(QMainWindow):
         if self.segments and QMessageBox.question(
                 self, APP_NAME, "Replace the current parts?") != QMessageBox.Yes:
             return
-        cuts = [0.0] + [self.snap(self.duration * k / n) for k in range(1, n)] + [self.duration]
-        cuts = sorted(set(cuts))
+        length = self.cuts.to_edit(self.duration)
+        points = [0.0] + [self.snap(self.cuts.to_source(length * k / n)) for k in range(1, n)] + [self.duration]
+        points = sorted(set(points))
         self._push_undo()
         self.segments.clear()
-        self.segments.extend(Segment(a, b) for a, b in zip(cuts, cuts[1:]) if b - a > 0.05)
+        self.segments.extend(Segment(a, b) for a, b in zip(points, points[1:]) if self.cuts.span(a, b) > 0.05)
         self._parts_changed(select=self.segments[0] if self.segments else None)
         self.statusBar().showMessage(f"Split into {len(self.segments)} parts.", 4000)
 
@@ -952,6 +1834,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Added part {fmt_time(start)} → {fmt_time(end)}", 4000)
 
     def delete_selected(self):
+        if self.timeline.selected_blocks:
+            self.delete_blocks()
+        else:
+            self.delete_part()
+
+    def delete_part(self):
         seg = self.timeline.selected
         if seg not in self.segments:
             return
@@ -972,6 +1860,8 @@ class MainWindow(QMainWindow):
             self._push_undo()
         self.timeline.in_point = None
         self.timeline.selected = None
+        self.timeline.selected_blocks = []
+        self._on_blocks_changed()
         self._refresh_all()
 
     def _on_edge_drag_finished(self, seg, which):
@@ -991,9 +1881,10 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(self.segments))
         size = self.info.get("size", 0)
         for i, seg in enumerate(self.segments):
-            est = seg.length / self.duration * size if self.duration else 0
-            values = [str(i + 1), seg.name or self._default_name(i), fmt_time(seg.start), fmt_time(seg.end),
-                      fmt_time(seg.length), "~" + fmt_size(est)]
+            length = self.cuts.span(seg.start, seg.end)
+            est = length / self.duration * size if self.duration else 0
+            values = [str(i + 1), seg.name or self._default_name(i), fmt_time(self.cuts.to_edit(seg.start)),
+                      fmt_time(self.cuts.to_edit(seg.end)), fmt_time(length), "~" + fmt_size(est)]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if col not in (1, 2, 3):
@@ -1025,6 +1916,9 @@ class MainWindow(QMainWindow):
             return
         rows = self.table.selectionModel().selectedRows()
         self.timeline.selected = self.segments[rows[0].row()] if rows else None
+        if rows and self.timeline.selected_blocks:
+            self.timeline.selected_blocks = []
+            self._on_blocks_changed()
         self.timeline.update()
 
     def _on_table_click(self, row, col):
@@ -1048,7 +1942,7 @@ class MainWindow(QMainWindow):
             if t is None:
                 self.statusBar().showMessage("Couldn't read that time — use h:mm:ss.ms", 4000)
             else:
-                t = self.snap(min(t, self.duration))
+                t = self.snap(self.cuts.to_source(min(t, self.cuts.to_edit(self.duration))))
                 if col == 2 and t < seg.end - 0.05:
                     seg.start = t
                 elif col == 3 and t > seg.start + 0.05:
@@ -1065,25 +1959,32 @@ class MainWindow(QMainWindow):
         self.timeline.update()
         self._update_time_label()
         n = len(self.segments)
-        total = sum(s.length for s in self.segments)
+        total = sum(self.cuts.span(s.start, s.end) for s in self.segments)
         self.parts_label.setText(f"<b>Parts: {n}</b>  ·  total {fmt_time(total, ms=False)}" if n else
                                  "<b>Parts</b> — press <b>S</b> to split at the playhead, or <b>I</b>/<b>O</b> to mark a part")
         busy = self.exporter is not None
-        self.export_btn.setText(f"Export {n} part{'s' if n != 1 else ''}" if n else "Export")
-        self.export_btn.setEnabled(bool(n) and not busy)
+        joined = len(self.clips) > 1
+        self.export_btn.setText(f"Export {n} part{'s' if n != 1 else ''}" if n else
+                                "Export edited video" if self.cuts else "Export joined video" if joined else "Export")
+        self.export_btn.setEnabled(bool(n or self.cuts or joined) and not busy)
         self.cancel_btn.setVisible(busy)
         self.progress.setVisible(busy)
         if self.path:
             i = self.info
             self.file_label.setText(
-                f"<b>{Path(self.path).name}</b><br>{i['width']}×{i['height']} · {i['fps']:.3g} fps · "
-                f"{fmt_size(i['size'])} · {fmt_time(self.duration, ms=False)}")
+                (f"<b>{len(self.clips)} videos</b> starting with {Path(self.path).name}<br>"
+                 if len(self.clips) > 1 else f"<b>{Path(self.path).name}</b><br>")
+                + f"{i['width']}×{i['height']} · {i['fps']:.3g} fps · "
+                f"{fmt_size(i['size'])} · {fmt_time(self.duration, ms=False)}"
+                + (f"<br>Edited: {fmt_time(self.cuts.to_edit(self.duration), ms=False)} "
+                   f"({len(self.cuts.ranges)} block{'s' if len(self.cuts.ranges) != 1 else ''} deleted)"
+                   if self.cuts else ""))
 
     # -- export
     def export(self):
         if not self._has_media() or self.exporter:
             return
-        if not self.segments:
+        if not self.segments and not self.cuts and len(self.clips) < 2:
             self.statusBar().showMessage("Add some parts first (S to split, I/O to mark a part).", 4000)
             return
         out_dir = self._output_dir()
@@ -1094,18 +1995,23 @@ class MainWindow(QMainWindow):
             return
 
         src = Path(self.path).resolve()
+        sources = {os.path.normcase(str(Path(c.path).resolve())) for c in self.clips}
+        # With no parts, export the whole (edited and/or joined) timeline as one file.
+        parts = [(seg.start, seg.end, seg.name or self._default_name(i)) for i, seg in enumerate(self.segments)] \
+            or [(0.0, self.duration, f"{src.stem} - {'edited' if self.cuts else 'joined'}")]
         jobs, seen = [], set()
-        for i, seg in enumerate(self.segments):
-            out = (out_dir / (sanitize_filename(seg.name or self._default_name(i)) + src.suffix)).resolve()
+        for i, (start, end, name) in enumerate(parts):
+            out = (out_dir / (sanitize_filename(name) + src.suffix)).resolve()
             key = os.path.normcase(str(out))
-            if key == os.path.normcase(str(src)):
+            if key in sources:
                 QMessageBox.critical(self, APP_NAME, f"Part {i + 1} would overwrite the source video. Rename it.")
                 return
             if key in seen:
                 QMessageBox.critical(self, APP_NAME, f"Two parts are both named '{out.name}'. Rename one.")
                 return
             seen.add(key)
-            jobs.append((seg.start, seg.length, str(out)))
+            pieces = [fp for a, b in self.cuts.kept(start, end) for fp in self._file_pieces(a, b)]
+            jobs.append((pieces, sum(b - a for _, a, b in pieces), str(out)))
 
         existing = [Path(j[2]).name for j in jobs if Path(j[2]).exists()]
         if existing and QMessageBox.question(
@@ -1119,7 +2025,7 @@ class MainWindow(QMainWindow):
                                 "Export anyway?") != QMessageBox.Yes:
             return
 
-        self.exporter = Exporter(self.ffmpeg, str(src), jobs, self)
+        self.exporter = Exporter(self.ffmpeg, jobs, self)
         self.exporter.progress.connect(self._on_export_progress)
         self.exporter.done.connect(self._on_export_done)
         self._export_clock = QElapsedTimer()
@@ -1167,8 +2073,9 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, e):
         files = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        files = [f for f in files if os.path.isfile(f)]
         if files:
-            self.load(files[0])
+            self.open_files(files, add=bool(self.clips))
 
     def closeEvent(self, e):
         if self.exporter:
@@ -1178,6 +2085,7 @@ class MainWindow(QMainWindow):
             self.exporter.cancel()
             if self.exporter and self.exporter.proc:
                 self.exporter.proc.waitForFinished(3000)
+        self._stop_waveform()
         self.player.stop()
         e.accept()
 
@@ -1213,8 +2121,9 @@ def main():
     apply_dark_theme(app)
     win = MainWindow()
     win.show()
-    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-        win.load(sys.argv[1])
+    files = [a for a in sys.argv[1:] if os.path.isfile(a)]
+    if files:
+        win.open_files(files)
     sys.exit(app.exec())
 
 
